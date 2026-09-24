@@ -1,0 +1,545 @@
+# 📡 Como a ESP32 Conversa com o Site Online
+
+**Guia técnico — Comunicação entre ESP32 e Vercel**
+
+Este documento explica, em detalhes, como o dispositivo físico (ESP32) se comunica com o dashboard web hospedado na Vercel, incluindo o que muda em relação ao ambiente local, o que acontece nos bastidores e como diagnosticar problemas.
+
+---
+
+## 📑 Índice
+
+1. [Visão Geral](#1-visão-geral)
+2. [Antes vs. Depois](#2-antes-vs-depois)
+3. [O Que Muda no Firmware](#3-o-que-muda-no-firmware)
+4. [Como a ESP32 Encontra a Vercel](#4-como-a-esp32-encontra-a-vercel)
+5. [Anatomia de uma Requisição](#5-anatomia-de-uma-requisição)
+6. [O Que NÃO Muda](#6-o-que-não-muda)
+7. [Como Testar a Comunicação](#7-como-testar-a-comunicação)
+8. [Cenários de Problema](#8-cenários-de-problema)
+9. [Diagrama do Fluxo Completo](#9-diagrama-do-fluxo-completo)
+10. [Resumo](#10-resumo)
+
+---
+
+## 1. Visão Geral
+
+Quando o dashboard sai do seu computador local e vai para a Vercel, **a ESP32 precisa falar com um servidor que não está mais na sua rede Wi-Fi**. Isso muda algumas coisas, mas **muito menos do que parece**.
+
+### A regra fundamental
+
+> **A ESP32 não sabe (nem precisa saber) que o servidor mudou de lugar.**
+>
+> Para ela, é só uma URL diferente. O resto do código é idêntico.
+
+---
+
+## 2. Antes vs. Depois
+
+### 🏠 Hoje — Servidor Local
+
+```
+┌─────────┐    Wi-Fi Rex     ┌───────────┐    LAN     ┌─────────────────┐
+│  ESP32  │ ───────────────► │ Roteador  │ ─────────► │  Seu PC         │
+│         │                  │           │            │  192.168.0.5    │
+└─────────┘                  └───────────┘            │  porta 3000     │
+                                                       └─────────────────┘
+                                                              │
+                                                              ▼
+                                                        dashboard.js
+```
+
+**Características:**
+- ESP32 e PC estão **na mesma rede local**
+- Comunicação via **IP privado** (`192.168.0.5`)
+- Protocolo **HTTP** (sem criptografia)
+- Funciona **só na sua casa**
+- Precisa do PC ligado **24h por dia**
+
+### ☁️ Depois — Servidor na Vercel
+
+```
+┌─────────┐    Wi-Fi Rex     ┌───────────┐   Internet   ┌──────────────────┐
+│  ESP32  │ ───────────────► │ Roteador  │ ───────────► │  Vercel          │
+│         │                  │           │              │  (data center)   │
+└─────────┘                  └───────────┘              │  HTTPS porta 443 │
+                                                        └──────────────────┘
+                                                              │
+                                                              ▼
+                                                    seu-app.vercel.app
+```
+
+**Características:**
+- ESP32 sai pela **internet** via roteador
+- Comunicação via **domínio público** (`seu-app.vercel.app`)
+- Protocolo **HTTPS** (criptografado)
+- Funciona **de qualquer lugar do mundo**
+- **Não precisa do PC ligado**
+
+---
+
+## 3. O Que Muda no Firmware
+
+**Só uma linha:**
+
+```cpp
+// ANTES (local)
+const char* API_URL = "http://192.168.0.5:3000/api/telemetry";
+
+// DEPOIS (Vercel)
+const char* API_URL = "https://monitor-alagamento.vercel.app/api/telemetry";
+```
+
+**Mais uma linha de segurança obrigatória:**
+
+```cpp
+HTTPClient http;
+http.begin(API_URL);
+http.setInsecure();  // ═══ ESSENCIAL para HTTPS na Vercel ═══
+http.addHeader("Content-Type", "application/json");
+http.addHeader("Authorization", String("Bearer ") + DEVICE_TOKEN);
+```
+
+### Por que `setInsecure()`?
+
+A ESP32, por padrão, **verifica o certificado HTTPS** do servidor. Como ela não tem o certificado raiz da Vercel gravado, a conexão falha.
+
+O `setInsecure()` diz:
+
+> "Aceite qualquer certificado, não verifique"
+
+**Trade-off:**
+- ✅ Faz funcionar imediatamente
+- ⚠️ Reduz segurança (vulnerável a MITM — *man-in-the-middle*)
+
+Para MVP, é aceitável. Em produção, o ideal é gravar o certificado raiz:
+
+```cpp
+static const char* root_ca = \
+  "-----BEGIN CERTIFICATE-----\n" \
+  "MIIFazCCBFOgAwIBAgIQC2...\n" \
+  "-----END CERTIFICATE-----\n";
+
+http.begin(API_URL, root_ca);
+```
+
+---
+
+## 4. Como a ESP32 Encontra a Vercel
+
+Quando a ESP32 executa `http.POST(body)`, acontece o seguinte:
+
+### Passo 1 — Resolução DNS
+
+```
+ESP32 pergunta: "Qual o IP de monitor-alagamento.vercel.app?"
+        ↓
+Servidor DNS responde: "76.76.21.21"
+        ↓
+ESP32 anota: "vou falar com 76.76.21.21"
+```
+
+O DNS é como uma **agenda telefônica da internet**. Traduz nomes (domínios) em números (IPs).
+
+### Passo 2 — Conexão TCP
+
+```
+ESP32 abre conexão com 76.76.21.21 na porta 443
+        ↓
+"Olá, quero estabelecer uma conexão segura"
+        ↓
+Vercel responde com seu certificado TLS
+```
+
+### Passo 3 — Handshake TLS (HTTPS)
+
+```
+ESP32:  "Aceito seu certificado (setInsecure)"
+Vercel: "Ok, conexão criptografada estabelecida"
+```
+
+A partir daqui, **tudo que for enviado é criptografado**.
+
+### Passo 4 — Envio do POST
+
+```
+POST /api/telemetry HTTP/1.1
+Host: monitor-alagamento.vercel.app
+Authorization: Bearer token-secreto-esp32-01
+Content-Type: application/json
+Content-Length: 187
+
+{
+  "distance_cm": 23.1,
+  "water_depth_cm": 8.5,
+  "rise_rate_cm_min": 2.3,
+  "alert": "danger",
+  "trend": "rising_fast",
+  "sensor_ok": true,
+  "wifi_rssi": -52,
+  "firmware_version": "5.0.0"
+}
+```
+
+### Passo 5 — Processamento na Vercel
+
+A Vercel executa a função Next.js em `app/api/telemetry/route.ts`:
+
+```typescript
+1. Valida token  → compare com DEVICE_TOKEN
+2. Valida payload → Zod schema
+3. Atualiza estado em RAM
+4. Faz broadcast via SSE para dashboards
+5. Retorna resposta
+```
+
+### Passo 6 — Resposta
+
+```
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"ok": true, "server_time": 1727102400000}
+```
+
+**Tempo total: ~200–500 ms**, dependendo da latência da sua internet.
+
+---
+
+## 5. Anatomia de uma Requisição
+
+### O que a ESP32 envia (bytes brutos)
+
+```
+POST /api/telemetry HTTP/1.1\r\n
+Host: monitor-alagamento.vercel.app\r\n
+Authorization: Bearer token-secreto-esp32-01\r\n
+Content-Type: application/json\r\n
+Content-Length: 187\r\n
+\r\n
+{"distance_cm":23.1,"water_depth_cm":8.5,...}
+```
+
+### O que a Vercel recebe (depois do TLS)
+
+Mesma coisa — **o TLS apenas criptografa o transporte**, o conteúdo é idêntico.
+
+### O que a Vercel processa (no código Next.js)
+
+```typescript
+// 1. Extrai o token do header
+const token = req.headers.get('authorization')?.replace('Bearer ', '')
+
+// 2. Compara com o token conhecido
+if (token !== DEVICE_TOKEN) return 401
+
+// 3. Lê o body
+const body = await req.json()
+
+// 4. Valida com Zod
+const parsed = Schema.safeParse(body)
+if (!parsed.success) return 422
+
+// 5. Guarda em RAM
+setDevice({ ...parsed.data, last_seen_at: Date.now() })
+
+// 6. Distribui via SSE
+broadcast({ type: 'update', device: getDevice() })
+
+// 7. Retorna
+return NextResponse.json({ ok: true })
+```
+
+---
+
+## 6. O Que NÃO Muda
+
+Independente de ser local ou Vercel:
+
+| Aspecto | Continua igual |
+|---------|----------------|
+| **Token** | `Bearer token-secreto-esp32-01` |
+| **Payload JSON** | Mesmos campos, mesmo formato |
+| **Frequência** | A cada 5 s (ou em mudança de estado) |
+| **Autenticação** | Header `Authorization` |
+| **Content-Type** | `application/json` |
+| **Formato da resposta** | `{"ok": true}` |
+| **Lógica local do alarme** | LEDs e buzzers não dependem da nuvem |
+
+### O que muda
+
+| Aspecto | Local | Vercel |
+|---------|-------|--------|
+| **Protocolo** | HTTP | HTTPS |
+| **Endereço** | IP privado (`192.168.0.5`) | Domínio público |
+| **Porta** | `:3000` | Implícita (`:443`) |
+| **PC precisa estar ligado** | ✅ Sim | ❌ Não |
+| **Acessível de fora** | ❌ Não | ✅ Sim |
+| **Certificado TLS** | Não usado | Obrigatório |
+| **Firewall local** | Precisa liberar | Não se aplica |
+
+---
+
+## 7. Como Testar a Comunicação
+
+### Pelo Serial Monitor da ESP32
+
+Depois de gravar o firmware atualizado:
+
+```
+Conectando Wi-Fi...
+Wi-Fi OK. IP: 192.168.0.42
+...
+POST 200 | Envios: 1 | Falhas: 0
+POST 200 | Envios: 2 | Falhas: 0
+POST 200 | Envios: 3 | Falhas: 0
+```
+
+**Interpretação:**
+- `POST 200` → ESP32 alcançou a Vercel, tudo ok
+- `POST FALHOU | code=-1` → Problema de conexão
+- `POST FALHOU | code=401` → Token errado
+- `POST FALHOU | code=422` → Payload malformado
+
+### Pela Vercel — Logs em tempo real
+
+1. Acesse [vercel.com](https://vercel.com)
+2. Abra o projeto
+3. Menu **"Logs"** ou **"Deployments → Functions"**
+4. Veja as requisições chegando:
+
+```
+POST  /api/telemetry  200  [45ms]
+POST  /api/telemetry  200  [38ms]
+POST  /api/telemetry  200  [52ms]
+```
+
+Cada linha é uma telemetria da ESP32.
+
+### Pelo navegador — Endpoint de debug
+
+Abre no navegador:
+
+```
+https://seu-app.vercel.app/api/telemetry
+```
+
+Retorna o estado atual em JSON:
+
+```json
+{
+  "device": {
+    "distance_cm": 23.1,
+    "water_depth_cm": 8.5,
+    "alert": "danger",
+    "last_seen_at": 1727102400000,
+    ...
+  }
+}
+```
+
+Se retornar `{"device": null}`, nenhuma leitura chegou ainda.
+
+---
+
+## 8. Cenários de Problema
+
+### 8.1 Wi-Fi conectado mas sem internet
+
+**Sintoma no serial:**
+```
+POST FALHOU | code=-1
+```
+
+**Causa:** O roteador transmite Wi-Fi local mas está sem link com a operadora.
+
+**Diagnóstico:** Tente abrir `https://google.com` no celular conectado ao mesmo Wi-Fi.
+
+**Solução:** é problema de infraestrutura — aguarde a internet voltar.
+
+---
+
+### 8.2 DNS não resolve
+
+**Sintoma no serial:**
+```
+POST FALHOU | code=-1
+[E][WiFiClient.cpp] connect(): DNS Failed
+```
+
+**Causa:** Roteador bloqueando DNS ou configurado com DNS ruim.
+
+**Solução:** Troque o DNS do roteador para `8.8.8.8` (Google) ou `1.1.1.1` (Cloudflare).
+
+---
+
+### 8.3 Certificado TLS
+
+**Sintoma:**
+```
+POST FALHOU | code=-1
+[E][ssl_client.cpp] set_verify(): Certificate verify failed
+```
+
+**Causa:** Esqueceu o `http.setInsecure()`.
+
+**Solução:** Adicione a linha:
+
+```cpp
+http.setInsecure();
+```
+
+---
+
+### 8.4 Token errado
+
+**Sintoma:**
+```
+POST FALHOU | code=401
+```
+
+**Causa:** `DEVICE_TOKEN` no firmware é diferente do `DEVICE_TOKEN` no `lib/store.ts`.
+
+**Solução:** Confira se os dois arquivos têm exatamente o mesmo texto:
+
+```cpp
+// ESP32
+const char* DEVICE_TOKEN = "token-secreto-esp32-01";
+```
+
+```typescript
+// lib/store.ts
+export const DEVICE_TOKEN = 'token-secreto-esp32-01'
+```
+
+---
+
+### 8.5 Payload inválido
+
+**Sintoma:**
+```
+POST FALHOU | code=422
+```
+
+**Causa:** Algum campo está fora do permitido (ex: `alert` com valor desconhecido).
+
+**Solução:** Verifique o schema Zod no servidor:
+
+```typescript
+alert: z.enum(['normal','attention','alert','danger','critical','sensor_fault']),
+```
+
+Se a ESP32 enviar `"danger "` (com espaço), falha.
+
+---
+
+### 8.6 Latência alta
+
+**Sintoma:** `POST 200` mas demora 2–3 segundos.
+
+**Causa:** Internet lenta ou Vercel em região distante.
+
+**Solução:** não é problema — o timeout do firmware é 5 s. Reduza para 3 s se ficar instável.
+
+---
+
+### 8.7 Cold start da Vercel
+
+**Sintoma:** Primeira requisição após horas demora ~2 s.
+
+**Causa:** Vercel "desligou" a função por inatividade. Precisa "acordar".
+
+**Solução:** comportamento normal do serverless. Após a primeira, fica rápido.
+
+---
+
+## 9. Diagrama do Fluxo Completo
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                       MUNDO FÍSICO (em casa)                         │
+│                                                                      │
+│   💧 Água sobe                                                       │
+│        │                                                             │
+│        ▼                                                             │
+│   HC-SR04 mede distância                                             │
+│        │                                                             │
+│        ▼                                                             │
+│   ESP32 calcula profundidade e estado                                │
+│        │                                                             │
+│        ├──► Aciona LED + buzzer (LOCAL, sem nuvem)                   │
+│        │                                                             │
+│        └──► Envia HTTP POST a cada 5s                                │
+└──────────────────────────────────┬───────────────────────────────────┘
+                                   │
+                                   │ Wi-Fi Rex
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                          ROTEADOR                                    │
+│                    (traduz LAN ↔ Internet)                           │
+└──────────────────────────────────┬───────────────────────────────────┘
+                                   │
+                                   │ Internet (provedor)
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                       VERCEL (HTTPS)                                 │
+│                                                                      │
+│  1. DNS resolve monitor-alagamento.vercel.app → 76.76.21.21          │
+│  2. Handshake TLS                                                    │
+│  3. POST /api/telemetry recebido                                     │
+│  4. Token validado                                                   │
+│  5. Payload validado (Zod)                                           │
+│  6. Estado atualizado em RAM                                         │
+│  7. Broadcast via SSE para dashboards conectados                     │
+└──────────────────────────────────┬───────────────────────────────────┘
+                                   │
+                                   │ SSE (conexão persistente)
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                    DASHBOARD (navegador)                             │
+│                                                                      │
+│  Tela atualiza automaticamente                                       │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Tempo total (água subir → tela mudar): ~2–3 segundos**
+
+---
+
+## 10. Resumo
+
+### Em uma frase
+
+> **A ESP32 trata a Vercel exatamente como tratava o PC — só troca o IP privado por um domínio público, `http` por `https`, e adiciona `setInsecure()`.**
+
+### O que muda no firmware
+
+```cpp
+// 1 linha
+- const char* API_URL = "http://192.168.0.5:3000/api/telemetry";
++ const char* API_URL = "https://monitor-alagamento.vercel.app/api/telemetry";
+
+// 1 linha em enviarTelemetria()
++ http.setInsecure();
+```
+
+### Vantagens do site online
+
+| Vantagem | Como |
+|----------|------|
+| Acessível de qualquer lugar | URL pública |
+| Sem precisar do PC ligado | Vercel roda 24/7 |
+| URL estável pra sempre | Domínio não muda |
+| HTTPS por padrão | Segurança automática |
+| Pronto para crescer | Suporta múltiplos dispositivos |
+
+### O que continua crítico
+
+- **A lógica local do alarme não depende da nuvem** — LEDs e buzzers funcionam sempre
+- **Se a internet cair**, a ESP32 continua medindo e alarmando localmente
+- **Quando a internet voltar**, ela retoma os envios automaticamente
+
+---
+
+**Fim do documento.**
+
+*Versão 1.0 — Documento técnico de comunicação ESP32 ↔ Vercel*
